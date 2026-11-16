@@ -65,6 +65,10 @@ describe("todoSnapshot", () => {
     // an init's input is one operation, not the list as it stands
     expect(todoSnapshot(call("todo", { op: "init", list: [{ phase: "Build", items: ["Parser"] }] }))).toBeNull();
     expect(todoSnapshot(call("TodoWrite", { todos: [] }))).toEqual([]);
+    // opencode's `todowrite` also sends `cancelled`: a given-up item, not one still to do
+    const opencode = call("todowrite", { todos: [{ content: "a", status: "completed" }, { content: "b", status: "cancelled" }] });
+    expect(todoSnapshot(opencode)).toEqual([{ label: "a", phase: null, status: "completed" }, { label: "b", phase: null, status: "dropped" }]);
+    expect(todoCallSummary(opencode)).toBe("1/2 done");
   });
 
   it("is null for an unreadable list and for other tools", () => {

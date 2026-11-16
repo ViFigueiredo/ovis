@@ -75,7 +75,8 @@ export function todoSnapshot(part: Tool): TodoItem[] | null {
     // one entry without words makes the list unreadable, not shorter
     if (label === null) return null;
     const status = fields["status"];
-    items.push({ label, phase: null, status: status === "completed" ? "completed" : status === "in_progress" ? "in_progress" : "pending" });
+    // opencode's `todowrite` also sends `cancelled`: an item given up, drawn as dropped
+    items.push({ label, phase: null, status: status === "completed" ? "completed" : status === "in_progress" ? "in_progress" : status === "cancelled" ? "dropped" : "pending" });
   }
   return items;
 }
