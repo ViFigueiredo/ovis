@@ -9,8 +9,8 @@
 # list runners: CI_SELF_HOSTED_CAPACITY (default 10) minus the queued and running jobs of every
 # workflow that could take those runners must leave at least the jobs one run needs. When that count
 # fails, the pull request stays hosted. Setting the variable to labels sends every pull request to
-# them, and the value "ubuntu-24.04" (a JSON string, which pages.yml and
-# release.yml also accept) keeps every job hosted while that PC is offline. A push to main takes the
+# them, and the value "ubuntu-24.04" (a JSON string, which release.yml also
+# accepts) keeps every job hosted while that PC is offline. A push to main takes the
 # repository variable CI_MAIN_SELF_HOSTED_LABELS over CI_SELF_HOSTED_LABELS when it is set, so main's
 # runs go to runners pull requests never use (run.sh --reserved); "ubuntu-24.04" there keeps only
 # main hosted, and deleting it puts main back on the shared runners. This script runs from the
@@ -25,16 +25,18 @@ requested="${REQUESTED_LABELS:-}"
 configured="${CONFIGURED_LABELS:-}"
 configured_from=CI_SELF_HOSTED_LABELS
 # CI_LINUX_SELF_HOSTED_LABELS moves only the Linux jobs of pull requests and branch pushes; a tag push, a workflow that calls ci.yml
-# (release-validate, pages, relay-deploy) or a manual run keeps CI_SELF_HOSTED_LABELS' routing
+# without hosted_only (relay-deploy) or a manual run keeps CI_SELF_HOSTED_LABELS' routing. A call with hosted_only (pages.yml's
+# and the Release's validation, HOSTED_ONLY=true) always gets the hosted image, before anything else is read
 if [[ ("$event" == pull_request || ("$event" == push && "${REF:-}" == refs/heads/*)) && -n "${LINUX_LABELS:-}" && -n "${LINUX_LABELS//[[:space:]]/}" ]]; then
   configured=$LINUX_LABELS
   configured_from=CI_LINUX_SELF_HOSTED_LABELS
 fi
 main_configured="${MAIN_LABELS:-}"
 capacity="${SELF_HOSTED_CAPACITY:-}"
-# the ci.yml jobs that run on the chosen Linux runner when it is self-hosted (Browser regression
-# has one shard there): Fast checks, Integration and both Browser regression jobs
-linux_jobs=4
+# the ci.yml jobs that run on the chosen Linux runner when it is self-hosted: Fast checks,
+# Integration, Browser regression (ui-regression) and the three parts of Browser regression (other
+# scripts) (scripts/ci-runner-route.test.ts holds this to ci.yml)
+linux_jobs=6
 
 choose_labels() {
   local source="$1" value="$2" compact
@@ -123,7 +125,10 @@ route_pull_request() {
 }
 
 route_linux() {
-if [[ ("$event" == "pull_request" || "$event" == "pull_request_target") && "${HEAD_REPO:-}" != "${REPOSITORY:-}" ]]; then
+if [[ "${HOSTED_ONLY:-}" == true ]]; then
+  echo "Runner: ubuntu-24.04 (called with hosted_only)" >&2
+  echo "linux=$hosted"
+elif [[ ("$event" == "pull_request" || "$event" == "pull_request_target") && "${HEAD_REPO:-}" != "${REPOSITORY:-}" ]]; then
   echo "Runner: ubuntu-24.04 (pull request from fork ${HEAD_REPO:-unknown})" >&2
   echo "linux=$hosted"
 elif [[ -n "${requested//[[:space:]]/}" ]]; then

@@ -1,43 +1,173 @@
 import { describe, expect, it } from "bun:test";
 import { chmodSync, copyFileSync, existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { randomBytes } from "node:crypto";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { DEFAULT_LOCK_PORT, MAX_RUNS_LIMIT, applyHostLimits, maxRuns, ticketPorts } from "./check.ts";
 
 const script = fileURLToPath(new URL("./self-hosted-runner/run.sh", import.meta.url));
 const jobStarted = fileURLToPath(new URL("./self-hosted-runner/job-started.sh", import.meta.url));
+const hookHarness = fileURLToPath(new URL("./self-hosted-runner/hook-test-harness.sh", import.meta.url));
 
-/** Runs the hook as the runner does, under a process named Runner.Worker (a copy of bash) that goes on after it. */
-function runJobStarted(eventName: string, payload: unknown, event: { raw?: string; path?: "missing" | "directory" | "unset"; repository?: "unset"; closedOutput?: boolean } = {}) {
+/**
+ * Runs the hook on this host, for jobs it allows only, under a parent that can never pass its proof of the worker:
+ * a copy of bash (on macOS a symlink to it) named not-the-worker. The hook may kill only its direct parent, and only
+ * when that parent's executable is Runner.Worker: /proc/<pid>/exe and the name on Linux, the path ps prints on macOS,
+ * all of which name this file. So a refusal nobody meant here blocks and kills nothing, and the test fails at its
+ * 5 s timeout, which ends the parent spawnSync holds and nothing else. Every refusal the tests mean runs in
+ * runHookIsolated.
+ */
+function runJobStarted(eventName: string, payload: unknown) {
   const tempDir = mkdtempSync(join(tmpdir(), "herdr-runner-hook-test-"));
   try {
-    let eventPath: string | undefined = join(tempDir, "event.json");
-    writeFileSync(eventPath, event.raw ?? JSON.stringify(payload));
-    if (event.path === "missing") eventPath = join(tempDir, "no-such-event.json");
-    if (event.path === "directory") eventPath = tempDir;
-    if (event.path === "unset") eventPath = undefined;
-    const worker = join(tempDir, "Runner.Worker");
-    copyFileSync(spawnSync("bash", ["-c", "command -v bash"], { encoding: "utf8" }).stdout.trim(), worker);
-    chmodSync(worker, 0o755);
-    // closedOutput: the hook's stdout and stderr are a pipe nobody reads any more (a FIFO whose only
-    // reader is closed before the hook starts), so its first write, even an error message, raises SIGPIPE
-    const hook = event.closedOutput
-      ? 'mkfifo "$1" && exec 4<>"$1" 5>"$1" 4<&- && bash "$0" >&5 2>&5; echo "next step ran"'
-      : 'bash "$0"; echo "next step ran"';
-    const result = spawnSync(worker, ["-c", hook, jobStarted, join(tempDir, "output.fifo")], {
+    const eventPath = join(tempDir, "event.json");
+    writeFileSync(eventPath, JSON.stringify(payload));
+    const parent = join(tempDir, "not-the-worker");
+    const bash = spawnSync("bash", ["-c", "command -v bash"], { encoding: "utf8" }).stdout.trim();
+    // macOS kills a copy of its signed /bin/bash at once
+    if (process.platform === "darwin") symlinkSync(bash, parent);
+    else {
+      copyFileSync(bash, parent);
+      chmodSync(parent, 0o755);
+    }
+    const result = spawnSync(parent, ["-c", 'bash "$0"; echo "next step ran"', jobStarted], {
       encoding: "utf8",
       timeout: 5_000,
-      env: {
-        PATH: process.env.PATH ?? "",
-        GITHUB_EVENT_NAME: eventName,
-        ...(event.repository === "unset" ? {} : { GITHUB_REPOSITORY: "devswha/ovis" }),
-        ...(eventPath === undefined ? {} : { GITHUB_EVENT_PATH: eventPath }),
-      },
+      env: { PATH: process.env.PATH ?? "", GITHUB_EVENT_NAME: eventName, GITHUB_REPOSITORY: "devswha/ovis", GITHUB_EVENT_PATH: eventPath },
     });
     expect(result.error).toBeUndefined();
     return result;
+  } finally {
+    rmSync(tempDir, { recursive: true, force: true });
+  }
+}
+
+/**
+ * How hook-test-harness.sh is started for each guard it checks itself. namespace: a PID namespace of its own
+ * (--kill-child ends it with unshare). container: a container of an image that carries the marker
+ * (hook-test.Dockerfile's), the harness made a child
+ * subreaper first, so the orphans of its subtree come to it.
+ */
+const HARNESS_LAUNCH = {
+  namespace: () => ["unshare", "--user", "--map-root-user", "--pid", "--fork", "--mount-proc", "--kill-child", "bash", hookHarness, randomBytes(16).toString("hex")],
+  container: () => ["python3", "-c", "import ctypes, os, sys\nif ctypes.CDLL(None).prctl(36, 1, 0, 0, 0) != 0: sys.exit(97)\nos.execv('/bin/bash', ['bash', *sys.argv[1:]])", hookHarness, "container"],
+} as const;
+type Isolation = keyof typeof HARNESS_LAUNCH;
+
+/**
+ * Where the hook's kill tests may run here: the first guard hook-test-harness.sh proves from inside, starting
+ * nothing before it. Any failure (no unshare, a namespace refused, no marker) only moves to the next guard
+ * or skips them, with every reason: never a reason to run them anywhere else.
+ */
+function probeIsolation(): { ok: true; mode: Isolation } | { ok: false; reason: string } {
+  if (process.platform !== "linux") return { ok: false, reason: `no PID namespace or runner container on ${process.platform}` };
+  const reasons: string[] = [];
+  for (const mode of ["namespace", "container"] as const) {
+    const tempDir = mkdtempSync(join(tmpdir(), "herdr-runner-hook-probe-"));
+    try {
+      const [command, ...args] = HARNESS_LAUNCH[mode]();
+      const probe = spawnSync(command!, [...args, "probe"], { encoding: "utf8", timeout: 10_000, env: { PATH: process.env.PATH ?? "", HARNESS_DIR: tempDir } });
+      if (probe.status === 0 && probe.stdout.trim() === "isolated") return { ok: true, mode };
+      reasons.push(`${mode}: ${(probe.stderr || probe.error?.message || `exit ${probe.status}`).trim()}`);
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  }
+  return { ok: false, reason: reasons.join("; ") };
+}
+
+/**
+ * The process that starts the hook (hook-test-harness.sh): the worker; the worker with a shell between them;
+ * the worker named systemd; a process named systemd that calls itself Runner.Worker; any other name; a parent
+ * that ends after the hook's start, before its refusal; or a process named systemd that ends once the hook says
+ * it blocks.
+ */
+type HookParent = "worker" | "nested" | "renamed" | "posing" | "gone" | "leaves" | `named:${string}`;
+
+/**
+ * What answers the hook's ps where it finds no /proc, as on macOS: procps itself, or a stub that fails, prints
+ * nothing, or names the parent like the worker but not quite. The hook is then a copy whose one line naming
+ * /proc and ps names a missing directory and that ps.
+ */
+type HookPs = "procps" | "fails" | "silent" | "lookalike";
+
+/**
+ * Runs the hook under hook-test-harness.sh behind the guard `mode`, which reports what happened: the
+ * parent's exit status (137: SIGKILL) or whether it still runs, whether the hook ended or blocks, whether the
+ * step after it ran, whether the decoys (another Runner.Worker, a Runner.Worker2) live, and whether every process
+ * above the harness still runs. `output` is what the hook wrote; `pidOne` what it wrote to PID 1's stderr (in a
+ * namespace, the harness's own; in a container, the container's output, which the test cannot see); `logged` what it sent to
+ * `logger` (the Mac's system log); `psCalls` every ps it ran.
+ */
+async function runHookIsolated(
+  mode: Isolation,
+  eventName: string,
+  payload: unknown,
+  event: { raw?: string; path?: "missing" | "directory" | "unset"; repository?: "unset"; closedOutput?: boolean; noJq?: boolean; parent?: HookParent; ps?: HookPs } = {},
+) {
+  const tempDir = mkdtempSync(join(tmpdir(), "herdr-runner-hook-test-"));
+  try {
+    const eventFile = join(tempDir, "event.json");
+    writeFileSync(eventFile, event.raw ?? JSON.stringify(payload));
+    let eventPath: string | undefined = event.parent === "gone" ? join(tempDir, "event.fifo") : eventFile;
+    if (event.path === "missing") eventPath = join(tempDir, "no-such-event.json");
+    if (event.path === "directory") eventPath = tempDir;
+    if (event.path === "unset") eventPath = undefined;
+    const bin = join(tempDir, "bin");
+    mkdirSync(bin);
+    writeFileSync(join(bin, "logger"), `#!/bin/sh\nprintf '%s\\n' "$*" >>'${tempDir}/logger.log'\n`, { mode: 0o755 });
+    // the hook's bash, alone, where jq is missing
+    if (event.noJq) symlinkSync(spawnSync("bash", ["-c", "command -v bash"], { encoding: "utf8" }).stdout.trim(), join(bin, "bash"));
+    let hook = jobStarted;
+    if (event.ps) {
+      const answer = {
+        procps: 'exec /bin/ps "$@"\n',
+        fails: "exit 1\n",
+        silent: "exit 0\n",
+        lookalike: 'case "$*" in *comm=*) echo /x/bin/Runner.Worker2;; *) exec /bin/ps "$@";; esac\n',
+      }[event.ps];
+      writeFileSync(join(bin, "ps"), `#!/bin/sh\nprintf '%s\\n' "$*" >>'${tempDir}/ps.log'\n${answer}`, { mode: 0o755 });
+      const text = readFileSync(jobStarted, "utf8");
+      const seam = "\nproc=/proc ps=/bin/ps\n";
+      expect(text.split(seam).length).toBe(2);
+      hook = join(tempDir, "job-started.sh");
+      writeFileSync(hook, text.replace(seam, `\nproc='${tempDir}/no-proc' ps='${bin}/ps'\n`));
+    }
+    const harness = Bun.spawn([...HARNESS_LAUNCH[mode](), event.parent ?? "worker", event.closedOutput ? "closed" : "open"], {
+      env: {
+        PATH: process.env.PATH ?? "",
+        HARNESS_DIR: tempDir,
+        HOOK: hook,
+        HOOK_PATH: event.noJq ? bin : `${bin}${delimiter}${process.env.PATH ?? ""}`,
+        GITHUB_EVENT_NAME: eventName,
+        // in a runner container the refusal also reaches the container's output: named as a test's
+        GITHUB_RUN_ID: "job-started-test",
+        ...(event.repository === "unset" ? {} : { GITHUB_REPOSITORY: "devswha/ovis" }),
+        ...(eventPath === undefined ? {} : { GITHUB_EVENT_PATH: eventPath }),
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+      timeout: 60_000,
+      killSignal: "SIGKILL",
+    });
+    const [stdout, stderr, status] = await Promise.all([new Response(harness.stdout).text(), new Response(harness.stderr).text(), harness.exited]);
+    const report = /^report (.*)$/m.exec(stdout)?.[1];
+    if (status !== 0 || report === undefined) throw new Error(`hook-test-harness.sh exited ${status}: ${stdout}${stderr}`);
+    const fields = new Map(report.split(" ").map((field) => [field.slice(0, field.indexOf("=")), field.slice(field.indexOf("=") + 1)]));
+    const read = (name: string) => (existsSync(join(tempDir, name)) ? readFileSync(join(tempDir, name), "utf8") : "");
+    return {
+      parent: fields.get("parent"),
+      hook: fields.get("hook"),
+      nextStepRan: fields.get("next") === "ran",
+      decoys: fields.get("decoys"),
+      above: fields.get("above"),
+      output: read("output"),
+      pidOne: stderr,
+      logged: read("logger.log"),
+      psCalls: read("ps.log"),
+    };
   } finally {
     rmSync(tempDir, { recursive: true, force: true });
   }
@@ -73,8 +203,20 @@ function runRunner(options: {
   branches?: string[];
   /** the check slots: "no-volume" fails the volume's creation, "fail" every making of the files, "fail-later" every one after the launcher's first; "started-elsewhere" has another slot's loop start the keeper in the same moment */
   slots?: "no-volume" | "fail" | "fail-later" | "started-elsewhere";
-  /** the slots' docker networks: "present" has them there already, "fail" fails their creation */
-  networks?: "present" | "fail";
+  /** the slots' docker networks: "fail" fails their creation */
+  networks?: "fail";
+  /** a slot's docker network there from the start, as the launcher's inspect of it reads: "<containers> <subnet>" */
+  network?: string;
+  /** subnets docker refuses to make a network on, as another network of its overlaps them */
+  takenSubnets?: string[];
+  /** more of the host's routes and addresses, as `ip -4 route show table all` and `ip -4 -o addr show` print them */
+  routes?: string[];
+  addrs?: string[];
+  /** the kernel's route to the internet (`ip route get`): "none" (at boot, before the LAN is up), one in a policy "table" of its
+   * own, "until-retry" (none until the slot's first wait to try again), "lost-after-rm" (gone once a network is removed) */
+  routeGet?: "none" | "table" | "until-retry" | "lost-after-rm";
+  /** OVIS_CI_NETWORK_BLOCK, the block of the runner networks */
+  networkBlock?: string;
 } = {}) {
   const { tempDir, args, env, logPath, envFile } = prepareRunner(options);
   try {
@@ -138,6 +280,33 @@ async function runRunnerUntilHung(options: RunnerOptions & { hang: "fetch" | "ls
   }
 }
 
+/**
+ * Shell helpers of the fake docker and the fake `ip`: the networks the fake docker holds, one
+ * "<name> <subnet>" a line (the ones it made, and slot 1's from the start until it is removed), and
+ * address arithmetic.
+ */
+const fakeNetworks = `held_networks() {
+  for file in "$RUNNER_TEST_LOG".network-*; do
+    case "$file" in *.network-rm-*) continue ;; esac
+    [ -e "$file" ] && printf '%s %s\\n' "\${file##*.network-}" "$(cat "$file")"
+  done
+  if [ -n "\${RUNNER_TEST_NETWORK:-}" ] && ! ls "$RUNNER_TEST_LOG".network-rm-*-1-net >/dev/null 2>&1; then
+    set -- $RUNNER_TEST_NETWORK
+    [ -n "\${2:-}" ] && printf 'from-before %s\\n' "$2"
+  fi
+  return 0
+}
+# "<first> <last>" of a.b.c.d/n, as numbers
+cidr() {
+  bits="\${1#*/}" old="$IFS"
+  IFS=.
+  set -- \${1%/*}
+  IFS="$old"
+  n=$(( ($1 << 24) + ($2 << 16) + ($3 << 8) + $4 )) size=$(( 1 << (32 - bits) ))
+  echo "$(( n - n % size )) $(( n - n % size + size - 1 ))"
+}
+dotted() { echo "$(( $1 >> 24 & 255 )).$(( $1 >> 16 & 255 )).$(( $1 >> 8 & 255 )).$(( $1 & 255 ))"; }`;
+
 function prepareRunner(options: RunnerOptions) {
   const tempDir = mkdtempSync(join(tmpdir(), "herdr-self-hosted-runner-test-"));
   const binDir = join(tempDir, "bin");
@@ -152,7 +321,13 @@ case " $* " in
   *registration-token*)
     # a refresh set to hang hangs before any runner starts, however soon --cache-wait runs out: the
     # test opens this FIFO once it has seen the hang
-    if [ -n "\${RUNNER_TEST_TOKEN_GATE:-}" ]; then read -r go < "$RUNNER_TEST_TOKEN_GATE"; fi
+    # With RUNNER_TEST_TOKEN_GATES, one FIFO for each request (gate.1, gate.2, ...): a second write to one
+    # FIFO could reach it while the first request still holds it open, and be lost.
+    if [ -n "\${RUNNER_TEST_TOKEN_GATE:-}" ]; then
+      gate="$RUNNER_TEST_TOKEN_GATE"
+      [ -z "\${RUNNER_TEST_TOKEN_GATES:-}" ] || gate="$gate.$(grep -c 'registration-token' "$RUNNER_TEST_LOG")"
+      read -r go < "$gate"
+    fi
     if [ "\${GH_TOKEN_EXIT_CODE:-0}" -ne 0 ]; then
       exit "$GH_TOKEN_EXIT_CODE"
     fi
@@ -162,6 +337,7 @@ esac
 `);
     // one line per call: the Bun cache build's script spans several
     writeFileSync(join(binDir, "docker"), `#!/bin/sh
+${fakeNetworks}
 printf 'docker %s\\n' "$(printf '%s' "$*" | tr '\\n' ' ')" >> "$RUNNER_TEST_LOG"
 for last; do :; done
 case "$1" in
@@ -175,13 +351,34 @@ case "$1" in
     echo made >> "$RUNNER_TEST_LOG.slots"
     case "\${RUNNER_TEST_SLOTS:-}" in fail) exit 1 ;; fail-later) [ "$(wc -l < "$RUNNER_TEST_LOG.slots")" -gt 1 ] && exit 1 ;; esac
     exit 0 ;;
-  # a slot's docker network: there once made, or from the start
+  # a slot's docker network: the one made, on the subnet it was made on, or slot 1's from the start
+  # (RUNNER_TEST_NETWORK: its containers and subnet) until it is removed
   network)
     case "$2" in
-      inspect) [ "\${RUNNER_TEST_NETWORKS:-}" = present ] || [ -e "$RUNNER_TEST_LOG.network-$last" ] ;;
-      create) [ "\${RUNNER_TEST_NETWORKS:-}" = fail ] && exit 1; : > "$RUNNER_TEST_LOG.network-$last" ;;
+      inspect)
+        if [ -e "$RUNNER_TEST_LOG.network-$last" ]; then printf '0 %s\\n' "$(cat "$RUNNER_TEST_LOG.network-$last")"
+        elif [ -n "\${RUNNER_TEST_NETWORK:-}" ] && [ "\${last%-1-net}" != "$last" ] && [ ! -e "$RUNNER_TEST_LOG.network-rm-$last" ]; then printf '%s\\n' "$RUNNER_TEST_NETWORK"
+        else exit 1; fi ;;
+      rm)
+        # docker refuses to remove a network a container is on, and keeps it
+        if [ ! -e "$RUNNER_TEST_LOG.network-$last" ] && [ -n "\${RUNNER_TEST_NETWORK:-}" ] && [ "\${last%-1-net}" != "$last" ] && [ ! -e "$RUNNER_TEST_LOG.network-rm-$last" ] && [ "\${RUNNER_TEST_NETWORK%% *}" != 0 ]; then
+          echo "Error response from daemon: error while removing network: network $last has active endpoints" >&2; exit 1
+        fi
+        : > "$RUNNER_TEST_LOG.network-rm-$last"; rm -f "$RUNNER_TEST_LOG.network-$last" ;;
+      create)
+        [ "\${RUNNER_TEST_NETWORKS:-}" = fail ] && exit 1
+        subnet="" prev=""
+        for arg; do [ "$prev" = --subnet ] && subnet="$arg"; prev="$arg"; done
+        # docker's refusal of a range another network of its overlaps: one it holds, or one the test hides
+        set -- $(cidr "$subnet")
+        low=$1 high=$2
+        if held_networks | { while read -r _ other; do set -- $(cidr "$other"); [ "$1" -le "$high" ] && [ "$low" -le "$2" ] && exit 0; done; exit 1; }; then
+          echo "Error response from daemon: invalid pool request: Pool overlaps with other one on this address space" >&2; exit 1
+        fi
+        case " \${RUNNER_TEST_TAKEN:-} " in *" $subnet "*) echo "Error response from daemon: invalid pool request: Pool overlaps with other one on this address space" >&2; exit 1 ;; esac
+        printf '%s\\n' "$subnet" > "$RUNNER_TEST_LOG.network-$last" ;;
     esac
-    exit $? ;;
+    exit 0 ;;
   container)
     [ "$2" = inspect ] || exit 1
     # the check slots' keeper: running once started. One that another slot's loop is starting holds
@@ -292,11 +489,56 @@ case "$1" in
 esac
 exit 0
 `);
+    // The host's routes and addresses: none in the runner networks' block unless a test adds them, but
+    // the lines Linux prints for the bridge of every network the fake docker holds. `route get`: the
+    // kernel's answer for a packet to the internet (RUNNER_TEST_ROUTE_GET).
+    writeFileSync(join(binDir, "ip"), `#!/bin/sh
+${fakeNetworks}
+unrouted() { echo "RTNETLINK answers: Network is unreachable" >&2; exit 2; }
+# the bridge of each network the fake docker holds: its route and local-table lines, or its address
+bridges() {
+  held_networks | while read -r name subnet; do
+    set -- "$1" $(cidr "$subnet")
+    dev="br-$(printf '%s' "$name" | cksum | cut -d' ' -f1)" gw="$(dotted $(( $2 + 1 )))" bc="$(dotted "$3")"
+    if [ "$1" = route ]; then
+      echo "$subnet dev $dev proto kernel scope link src $gw linkdown"
+      echo "local $gw dev $dev table local proto kernel scope host src $gw"
+      echo "broadcast $bc dev $dev table local proto kernel scope link src $gw linkdown"
+    else
+      echo "40: $dev    inet $gw/\${subnet#*/} brd $bc scope global $dev"
+    fi
+  done
+}
+case "$*" in
+  *"route get"*)
+    case "\${RUNNER_TEST_ROUTE_GET:-}" in
+      none) unrouted ;;
+      table) printf '%s\\n' "1.1.1.1 via 192.168.0.1 dev eth1 table 100 src 192.168.0.10 uid 1000" "    cache"; exit 0 ;;
+      # the route comes up once the slot has waited to try again
+      until-retry) grep -qx 'sleep 30' "$RUNNER_TEST_LOG" || unrouted ;;
+      # the route goes once the launcher has removed a network
+      lost-after-rm) grep -q '^docker network rm ' "$RUNNER_TEST_LOG" && unrouted ;;
+    esac
+    printf '%s\\n' "1.1.1.1 via 192.168.0.1 dev eth0 src 192.168.0.10 uid 1000" "    cache" ;;
+  *route*)
+    if [ "\${RUNNER_TEST_ROUTE_GET:-}" = table ]; then echo "default via 192.168.0.1 dev eth1 table 100 proto static"; else echo "default via 192.168.0.1 dev eth0 proto dhcp"; fi
+    echo "192.168.0.0/24 dev eth0 proto kernel scope link src 192.168.0.10"
+    [ -n "\${RUNNER_TEST_ROUTES:-}" ] && printf '%s\\n' "$RUNNER_TEST_ROUTES"
+    bridges route ;;
+  *addr*) printf '%s\\n' "2: eth0    inet 192.168.0.10/24 brd 192.168.0.255 scope global eth0"
+    [ -n "\${RUNNER_TEST_ADDRS:-}" ] && printf '%s\\n' "$RUNNER_TEST_ADDRS"
+    bridges addr ;;
+esac
+exit 0
+`);
+    chmodSync(join(binDir, "ip"), 0o755);
     // The launcher's wait before every container of a slot is logged and not sat out; every other
     // sleep of the launcher is the system's own.
     const sleep = spawnSync("bash", ["-c", "command -v sleep"], { encoding: "utf8" }).stdout.trim();
     writeFileSync(join(binDir, "sleep"), `#!/bin/sh
 if [ "$*" = 2 ]; then printf 'sleep 2\\n' >> "$RUNNER_TEST_LOG"; exit 0; fi
+# a slot's first wait before it tries again, when a test asks for it
+if [ -n "\${RUNNER_TEST_NO_BACKOFF:-}" ] && [ "$*" = 30 ]; then printf 'sleep 30\\n' >> "$RUNNER_TEST_LOG"; exit 0; fi
 exec "${sleep}" "$@"
 `);
     chmodSync(join(binDir, "sleep"), 0o755);
@@ -342,6 +584,12 @@ exec "${sleep}" "$@"
       ...(options.stubborn ? { RUNNER_TEST_STUBBORN: options.stubborn === "helper" ? "helper" : "1" } : {}),
       ...(options.slots ? { RUNNER_TEST_SLOTS: options.slots } : {}),
       ...(options.networks ? { RUNNER_TEST_NETWORKS: options.networks } : {}),
+      ...(options.network ? { RUNNER_TEST_NETWORK: options.network } : {}),
+      ...(options.takenSubnets ? { RUNNER_TEST_TAKEN: options.takenSubnets.join(" ") } : {}),
+      ...(options.routes ? { RUNNER_TEST_ROUTES: options.routes.join("\n") } : {}),
+      ...(options.addrs ? { RUNNER_TEST_ADDRS: options.addrs.join("\n") } : {}),
+      ...(options.routeGet ? { RUNNER_TEST_ROUTE_GET: options.routeGet } : {}),
+      ...(options.networkBlock !== undefined ? { OVIS_CI_NETWORK_BLOCK: options.networkBlock } : {}),
       RUNNER_TEST_DEFAULT_BRANCH: options.defaultBranch ?? "main",
       RUNNER_TEST_BRANCHES: (options.branches ?? ["main"]).join(" "),
       XDG_CACHE_HOME: options.cacheHome ?? join(tempDir, "cache"),
@@ -352,6 +600,8 @@ exec "${sleep}" "$@"
       DOCKER_EXIT_CODE: String(options.dockerExitCode ?? 42),
       DOCKER_FAIL_SLOT: String(options.failedSlot ?? ""),
     };
+    // the launcher's own block unless a test names one, whatever the host running the tests sets
+    if (options.networkBlock === undefined) delete env.OVIS_CI_NETWORK_BLOCK;
     return { tempDir, args, env, logPath, envFile };
   }
 }
@@ -603,7 +853,7 @@ describe.skipIf(process.platform === "win32")("self-hosted runner launcher", () 
     expect(calls.split("\n").filter((call) => runnerRun.test(call))).toEqual([]);
   });
 
-  it("gives every slot a docker network of its own, never the host's or another container's, and removes them at its stop", () => {
+  it("gives every slot a docker network of its own, on its own /28 of the block, never the host's or another container's, and removes them at its stop", () => {
     const { result, calls } = runRunner({ count: 2 });
     expect(result.status).toBe(0);
     const lines = calls.split("\n");
@@ -613,8 +863,10 @@ describe.skipIf(process.platform === "win32")("self-hosted runner launcher", () 
       const network = `${call.match(/--name (\S+)/)![1]!}-net`;
       // its own, and no other: not the host's, not another container's namespace
       expect(call.match(/--network \S+/g)).toEqual([`--network ${network}`]);
-      // made before its runner starts, as a bridge network of docker's
-      const made = lines.indexOf(`docker network create --driver bridge ${network}`);
+      // made before its runner starts, as a bridge network of docker's on the slot's own /28 of the
+      // block (slot N on its Nth), with docker's own gateway
+      const slot = Number(network.match(/-(\d+)-net$/)![1]);
+      const made = lines.indexOf(`docker network create --driver bridge --subnet 10.213.0.${16 * (slot - 1)}/28 ${network}`);
       expect(made).toBeGreaterThanOrEqual(0);
       expect(made).toBeLessThan(index);
       return network;
@@ -623,17 +875,225 @@ describe.skipIf(process.platform === "win32")("self-hosted runner launcher", () 
     // removed once every runner container has stopped
     const lastStop = Math.max(...lines.map((call, index) => (/^docker stop -t 30 herdr-ci-\S+-\d+$/.test(call) ? index : -1)));
     for (const network of networks) expect(lines.indexOf(`docker network rm ${network}`)).toBeGreaterThan(lastStop);
-    // a network that is there is used as it is
-    const again = runRunner({ count: 2, networks: "present" });
-    expect(again.result.status).toBe(0);
-    expect(again.calls).not.toContain("docker network create");
-    expect(again.calls.split("\n").filter((call) => runnerRun.test(call))).toHaveLength(2);
+  });
+
+  /** The subnets the launcher asked docker for, in order: every slot's, or one slot's. */
+  const subnetsAsked = (calls: string, slot?: number) => calls.split("\n").flatMap((call) => (slot === undefined || call.endsWith(`-${slot}-net`) ? /^docker network create .*--subnet (\S+) /.exec(call)?.[1] ?? [] : []));
+  /** The runner networks' calls that make or remove one before the first runner starts, without the network's name. */
+  const networkChanges = (calls: string) => {
+    const lines = calls.split("\n");
+    const runner = lines.findIndex((call) => runnerRun.test(call));
+    expect(runner).toBeGreaterThanOrEqual(0);
+    return lines.slice(0, runner).filter((call) => /^docker network (rm|create) /.test(call)).map((call) => call.replace(/ herdr-ci-\S+-net$/, ""));
+  };
+  /** The calls that make or remove a network before the launcher's stop. */
+  const changesBeforeStop = (calls: string) => {
+    const lines = calls.split("\n");
+    const lastStop = Math.max(...lines.map((call, index) => (/^docker stop -t 30 herdr-ci-\S+-\d+$/.test(call) ? index : -1)));
+    return lines.slice(0, lastStop).filter((call) => /^docker network (rm|create) /.test(call));
+  };
+
+  /**
+   * Runs the launcher with its slots' loops going on (no --once, the first 30 s wait before a slot
+   * tries again not sat out) until slot 1's runner has asked for its token `tokens` times, which
+   * it does only once it has its network: whether it got there, and its calls until then.
+   */
+  async function runUntilToken(options: RunnerOptions, tokens = 1) {
+    const { tempDir, args, env, logPath } = prepareRunner({ ...options, args: ["--no-cache", ...(options.args ?? [])] });
+    const gate = join(tempDir, "token-gate");
+    // one FIFO for each request, and one more, which no one opens, for a request after them
+    spawnSync("mkfifo", Array.from({ length: tokens + 1 }, (_, index) => `${gate}.${index + 1}`));
+    // a process group of its own: the slot's loop runs on until it is killed with it
+    const child = spawn("bash", args.filter((arg) => arg !== "--once"), { env: { ...env, RUNNER_TEST_TOKEN_GATE: gate, RUNNER_TEST_TOKEN_GATES: "1", RUNNER_TEST_NO_BACKOFF: "1" }, detached: true, stdio: "ignore" });
+    const exited = new Promise((resolve) => child.once("exit", resolve));
+    try {
+      // the gh stub reads request n's FIFO when the slot asks for its nth token: opening it for writing waits for that
+      const reached = await endsWithin(["sh", "-c", 'i=1; while [ "$i" -le "$1" ]; do echo go > "$0.$i"; i=$((i + 1)); done', gate, String(tokens)], LOADED_BOUND_MS);
+      return { reached, calls: readFileSync(logPath, "utf8") };
+    } finally {
+      try {
+        process.kill(-child.pid!, "SIGKILL");
+      } catch (error) {
+        // ESRCH: every process of the group has ended already
+        if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+      }
+      await exited;
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  }
+
+  it("puts no slot's network on a range the host routes or has an address in, a VPN's two halves of the internet aside", () => {
+    const { result, calls } = runRunner({
+      routes: ["0.0.0.0/1 via 10.8.0.1 dev tun0", "128.0.0.0/1 via 10.8.0.1 dev tun0", "10.213.0.0/28 dev br-a proto kernel scope link src 10.213.0.1 linkdown", "unreachable 10.213.0.32/27"],
+      addrs: ["9: br-b    inet 10.213.0.20/30 brd 10.213.0.23 scope global br-b"],
+    });
+    expect(result.status).toBe(0);
+    // .0/28 is routed, .16/28 holds an address of the host, .32/27 (two /28s) is routed
+    expect(subnetsAsked(calls)).toEqual(["10.213.0.64/28"]);
+    expect(calls.split("\n").filter((call) => runnerRun.test(call))).toHaveLength(1);
+  });
+
+  it("counts the host's own address on a point-to-point link, which has no network of its own", () => {
+    // as `ip -o addr` prints it, and as the local table holds it
+    for (const host of [{ addrs: ["7: tun0    inet 10.213.0.6 peer 10.213.0.5/32 scope global tun0"] }, { routes: ["local 10.213.0.6 dev tun0 table local proto kernel scope host src 10.213.0.6"] }]) {
+      const { result, calls } = runRunner(host);
+      expect(result.status).toBe(0);
+      expect(subnetsAsked(calls)).toEqual(["10.213.0.16/28"]);
+    }
+  });
+
+  /** A full-tunnel VPN's routes in place of a default route. */
+  const fourQuarters = ["0.0.0.0/2", "64.0.0.0/2", "128.0.0.0/2", "192.0.0.0/2"].map((route) => `${route} dev tun0 scope link`);
+
+  it("takes a route broader than /8 for a default, not a network, and counts /8 and narrower", () => {
+    // broader than /8: a /7, one /1 alone, a VPN's four /2s
+    for (const routes of [["10.0.0.0/7 via 10.8.0.1 dev tun0"], ["0.0.0.0/1 via 10.8.0.1 dev tun0"], fourQuarters]) {
+      const { result, calls } = runRunner({ routes });
+      expect(result.status).toBe(0);
+      expect(subnetsAsked(calls)).toEqual(["10.213.0.0/28"]);
+    }
+    // a LAN beside the four /2s still counts
+    const lan = runRunner({ routes: [...fourQuarters, "10.213.0.0/28 dev eth1 proto kernel scope link src 10.213.0.2"] });
+    expect(lan.result.status).toBe(0);
+    expect(subnetsAsked(lan.calls)).toEqual(["10.213.0.16/28"]);
+  });
+
+  it("makes no network where a /8 route covers the whole block, and names the variable for another block", () => {
+    for (const routes of [["10.0.0.0/8 via 10.8.0.1 dev tun0"], [...fourQuarters, "10.0.0.0/8 via 10.8.0.1 dev tun0"]]) {
+      const { result, calls } = runRunner({ routes });
+      expect(result.status).toBe(1);
+      expect(subnetsAsked(calls)).toEqual([]);
+      expect(result.stderr).toMatch(/\[herdr-ci-\S+-1\] .*OVIS_CI_NETWORK_BLOCK.*; retrying in 30s/);
+      expect(calls).not.toContain("registration-token");
+      // a host that routes all of 10.0.0.0/8 takes a block in 172.16.0.0/16
+      const other = runRunner({ routes, networkBlock: "172.16.0.0/16" });
+      expect(other.result.status).toBe(0);
+      expect(subnetsAsked(other.calls)).toEqual(["172.16.0.0/28"]);
+    }
+  });
+
+  it("goes on from the block's start for a slot whose own /28 and every one after it are taken", () => {
+    // slot 1 keeps its network on .32/28; slot 2's own .16/28 and everything from .48 are routed
+    const { result, calls } = runRunner({ count: 2, networkBlock: "10.213.0.0/24", network: "0 10.213.0.32/28", routes: ["10.213.0.16/28 dev eth1", "10.213.0.48/28 dev eth1", "10.213.0.64/26 dev eth1", "10.213.0.128/25 dev eth1"] });
+    expect(result.status).toBe(0);
+    expect(subnetsAsked(calls, 1)).toEqual([]);
+    expect(subnetsAsked(calls, 2)).toEqual(["10.213.0.0/28"]);
+  });
+
+  it("tries the next range when docker refuses one another of its networks overlaps", () => {
+    const { result, calls } = runRunner({ takenSubnets: ["10.213.0.0/28", "10.213.0.16/28"] });
+    expect(result.status).toBe(0);
+    expect(subnetsAsked(calls)).toEqual(["10.213.0.0/28", "10.213.0.16/28", "10.213.0.32/28"]);
+    expect(calls.split("\n").filter((call) => runnerRun.test(call))).toHaveLength(1);
+  });
+
+  it("goes on after sixteen refusals, on its next try, from the range where it stopped", async () => {
+    const taken = Array.from({ length: 16 }, (_, index) => `10.213.0.${16 * index}/28`);
+    const { reached, calls } = await runUntilToken({ takenSubnets: taken });
+    expect(reached).toBe(true);
+    const lines = calls.split("\n");
+    const retry = lines.indexOf("sleep 30");
+    expect(retry).toBeGreaterThanOrEqual(0);
+    expect(subnetsAsked(lines.slice(0, retry).join("\n"))).toEqual(taken);
+    expect(subnetsAsked(lines.slice(retry).join("\n"))).toEqual(["10.213.1.0/28"]);
+  }, HUNG_RUN_MS);
+
+  it("removes and makes no network while the kernel has no route to the internet, by its own answer", async () => {
+    // none, as at boot before the LAN is up (an unreachable, prohibit or blackhole route fails the lookup the same way): a network from before the block stays too
+    const none = runRunner({ routeGet: "none", network: "0 172.18.0.0/16" });
+    expect(none.result.status).toBe(1);
+    expect(none.result.stderr).toMatch(/\[herdr-ci-\S+-1\] this host has no default route yet.*; retrying in 30s/);
+    expect(changesBeforeStop(none.calls)).toEqual([]);
+    expect(none.calls).not.toContain("registration-token");
+    // a default route in a policy table of its own is a route
+    const table = runRunner({ routeGet: "table" });
+    expect(table.result.status).toBe(0);
+    expect(subnetsAsked(table.calls)).toEqual(["10.213.0.0/28"]);
+    // asked again after a removal: a route gone meanwhile makes nothing
+    const lost = runRunner({ routeGet: "lost-after-rm", network: "0 172.18.0.0/16" });
+    expect(lost.result.status).toBe(1);
+    expect(lost.result.stderr).toMatch(/\[herdr-ci-\S+-1\] this host has no default route yet.*; retrying in 30s/);
+    expect(changesBeforeStop(lost.calls).map((call) => call.replace(/ herdr-ci-\S+-net$/, ""))).toEqual(["docker network rm"]);
+    // the route comes up while the slot waits to try again
+    const later = await runUntilToken({ routeGet: "until-retry" });
+    expect(later.reached).toBe(true);
+    const lines = later.calls.split("\n");
+    const retry = lines.indexOf("sleep 30");
+    expect(retry).toBeGreaterThanOrEqual(0);
+    expect(subnetsAsked(lines.slice(0, retry).join("\n"))).toEqual([]);
+    expect(subnetsAsked(lines.slice(retry).join("\n"))).toEqual(["10.213.0.0/28"]);
+  }, HUNG_RUN_MS);
+
+  it("keeps a slot's network whose only range is a /28 of the block, across the slot's starts, and makes any other again when no container is on it", async () => {
+    expect(networkChanges(runRunner({ network: "0 10.213.0.48/28" }).calls)).toEqual([]);
+    // made at the first start, kept at the second, with its bridge's lines in the host's routes
+    const twice = await runUntilToken({}, 2);
+    expect(twice.reached).toBe(true);
+    expect(twice.calls.split("\n").filter((call) => call.includes("registration-token")).length).toBeGreaterThanOrEqual(2);
+    expect(subnetsAsked(twice.calls)).toEqual(["10.213.0.0/28"]);
+    expect(twice.calls).not.toContain("docker network rm");
+    for (const network of [
+      // made by docker from its own pools, as before the block
+      "0 172.18.0.0/16",
+      // in the block, but not one /28 of it
+      "0 10.213.0.0/24",
+      // a /28 of the block, and another range
+      "0 10.213.0.48/28 10.213.0.64/28",
+      // no range at all
+      "0",
+    ]) {
+      const { result, calls } = runRunner({ network });
+      expect(result.status).toBe(0);
+      expect(networkChanges(calls)).toEqual(["docker network rm", "docker network create --driver bridge --subnet 10.213.0.0/28"]);
+      expect(calls.split("\n").find((call) => runnerRun.test(call))).toMatch(/ --network herdr-ci-\S+-1-net /);
+    }
+  }, HUNG_RUN_MS);
+
+  it("leaves a slot's network it would make again that a container is on, and starts no runner in its slot", () => {
+    for (const network of ["1 192.168.0.0/20", "1 10.213.0.0/24", "1"]) {
+      const { tempDir, args, env, logPath } = prepareRunner({ network });
+      try {
+        const result = spawnSync("bash", args, { encoding: "utf8", timeout: 10_000, env });
+        expect(result.error).toBeUndefined();
+        expect(result.status).toBe(1);
+        expect(result.stderr).toMatch(/\[herdr-ci-\S+-1\] .*herdr-ci-\S+-1-net \(\S.*; retrying in 30s/);
+        const calls = readFileSync(logPath, "utf8");
+        expect(calls).not.toContain("docker network create");
+        // the launcher's stop alone asks docker to remove it, and docker keeps it while a container is on it
+        expect(changesBeforeStop(calls)).toEqual([]);
+        expect(calls).toMatch(/^docker network rm herdr-ci-\S+-1-net$/m);
+        expect(readdirSync(tempDir).filter((file) => file.includes(".network-rm-"))).toEqual([]);
+        expect(calls).not.toContain("registration-token");
+        expect(calls.split("\n").filter((call) => runnerRun.test(call))).toEqual([]);
+      } finally {
+        rmSync(tempDir, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it("refuses a block for the runner networks outside 10.0.0.0/8 and 172.16.0.0/16, or that is no network address, before starting anything", () => {
+    for (const block of ["192.168.100.0/24", "192.168.0.0/16", "8.8.0.0/16", "100.64.0.0/16", "172.17.0.0/16", "172.30.0.0/24", "172.16.0.0/12", "10.213.0.1/16", "10.213.0.0/28", "10.213.0.0", "010.213.0.0/16"]) {
+      const { result, calls } = runRunner({ networkBlock: block });
+      expect(result.status).toBe(2);
+      expect(result.stderr).toContain(`OVIS_CI_NETWORK_BLOCK=${block} `);
+      expect(calls).toBe("");
+    }
+    for (const [block, subnet] of [["10.77.0.0/24", "10.77.0.0/28"], ["172.16.0.0/16", "172.16.0.0/28"], ["172.16.5.0/24", "172.16.5.0/28"]]) {
+      const { result, calls } = runRunner({ networkBlock: block });
+      expect(result.status).toBe(0);
+      expect(subnetsAsked(calls)).toEqual([subnet]);
+    }
   });
 
   it("starts no runner, and asks for no token, in a slot whose network cannot be made", () => {
     const { result, calls } = runRunner({ networks: "fail" });
     expect(result.status).toBe(1);
     expect(result.stderr).toMatch(/\[herdr-ci-\S+-1\] could not make the docker network herdr-ci-\S+-1-net; retrying in 30s/);
+    // a bounded number of ranges, each tried once
+    const tried = subnetsAsked(calls);
+    expect(tried.length).toBeGreaterThan(1);
+    expect(tried.length).toBeLessThanOrEqual(16);
+    expect(new Set(tried).size).toBe(tried.length);
     expect(calls).not.toContain("registration-token");
     expect(calls.split("\n").filter((call) => runnerRun.test(call))).toEqual([]);
   });
@@ -1037,57 +1497,189 @@ describe.skipIf(process.platform === "win32")("self-hosted runner launcher", () 
   });
 });
 
-// the runner image is Linux, and the hook finds the worker through /proc
-describe.skipIf(process.platform !== "linux")("self-hosted runner job-started hook", () => {
+// The hook as the runner runs it. Only a job it allows runs on the host: every refusal may kill, so every test that
+// can reach one runs isolated (runHookIsolated: a PID namespace of its own or a container of an image that carries the
+// marker, hook-test.Dockerfile's), or not at all.
+describe.skipIf(process.platform === "win32")("self-hosted runner job-started hook", () => {
   it("runs a job from this repository", () => {
+    // without jq the hook would refuse (and, under runJobStarted's parent, block): fail before it starts
+    expect(Bun.which("jq")).not.toBeNull();
     for (const [event, payload] of [
       ["push", { ref: "refs/heads/main" }],
+      ["workflow_dispatch", { inputs: {} }],
+      ["schedule", { schedule: "0 3 * * *" }],
+      ["merge_group", { merge_group: { head_sha: "abc" } }],
       ["pull_request", { pull_request: { head: { repo: { full_name: "devswha/ovis" } } } }],
+      ["pull_request_review", { pull_request: { head: { repo: { full_name: "devswha/ovis" } } } }],
       ["workflow_run", { workflow_run: { head_repository: { full_name: "devswha/ovis" } } }],
+      ["issue_comment", { issue: { number: 1 }, comment: { id: 2 } }],
     ] as const) {
       const result = runJobStarted(event, payload);
       expect(result.status).toBe(0);
       expect(result.stdout).toContain("next step ran");
     }
   });
+});
 
-  it("refuses a job carrying another repository's code before it runs", () => {
+const isolation = probeIsolation();
+if (!isolation.ok) console.warn(`job-started hook kill tests skipped, as they run only in a PID namespace of their own or a container of an image that carries the marker (hook-test.Dockerfile): ${isolation.reason}`);
+
+// The runner image is Linux, where the hook proves its parent through /proc; the Mac runner (README "Mac runner")
+// runs the same file, which asks ps there: the copies with { ps } run that path here, on Linux.
+describe.skipIf(!isolation.ok)("self-hosted runner job-started hook, isolated", () => {
+  const mode = isolation.ok ? isolation.mode : "namespace";
+  const runHook = (eventName: string, payload: unknown, event?: Parameters<typeof runHookIsolated>[3]) => runHookIsolated(mode, eventName, payload, event);
+  const fork = { pull_request: { head: { repo: { full_name: "someone/ovis" } } } };
+  type Run = Awaited<ReturnType<typeof runHookIsolated>>;
+
+  /** A refused job: its worker SIGKILLed before the next step, nothing else dead, the refusal said where it is kept. */
+  function expectKilled(run: Run, output: "said" | "closed" = "said") {
+    // a failing hook alone would let `if: always()` steps run: the worker itself is killed
+    expect(run.parent).toBe("137");
+    expect(run.nextStepRan).toBe(false);
+    expect(run.decoys).toBe("alive");
+    expect(run.above).toBe("alive");
+    // a closed output takes the refusal with it: the kill alone is the evidence there
+    if (output === "said") {
+      expect(run.output).toContain("::error::");
+      // Linux writes it to PID 1's output (a container's), never to logger
+      if (mode === "namespace") expect(run.pidOne).toContain("[job-started] ");
+      expect(run.logged).toBe("");
+    }
+  }
+
+  /** A refusal whose parent is not proven the worker: nothing killed, the hook blocks in its step, no step after it. */
+  function expectBlocked(run: Run) {
+    expect(run.hook).toBe("blocked");
+    expect(run.parent).toBe("running");
+    expect(run.nextStepRan).toBe(false);
+    expect(run.decoys).toBe("alive");
+    expect(run.above).toBe("alive");
+    expect(run.output).toContain("::error::");
+  }
+
+  it("refuses a job carrying another repository's code before it runs", async () => {
+    const named = (fullName: unknown) => ({ pull_request: { head: { repo: { full_name: fullName } } } });
     for (const [event, payload] of [
-      ["pull_request", { pull_request: { head: { repo: { full_name: "someone/ovis" } } } }],
-      ["pull_request_target", { pull_request: { head: { repo: { full_name: "someone/ovis" } } } }],
+      ["pull_request", fork],
+      ["pull_request_target", fork],
+      ["pull_request_review", fork],
+      ["pull_request_review_comment", fork],
       ["pull_request", { pull_request: { head: { repo: null } } }],
       ["workflow_run", { workflow_run: { head_repository: { full_name: "someone/ovis" } } }],
+      ["workflow_run", { workflow_run: { head_repository: null } }],
+      // only this repository's name, exactly: no other case, space, look-alike letter or character
+      ["pull_request", named("Devswha/Ovis")],
+      ["pull_request", named("devswha/ovis ")],
+      ["pull_request", named("devswha/\u043evis")],
+      ["pull_request", named("devswha/ovis\u200b")],
+      ["pull_request", named("devswha/ovis\n")],
+      ["pull_request", named(12345)],
+      ["pull_request", named({ name: "devswha/ovis" })],
     ] as const) {
-      const result = runJobStarted(event, payload);
-      // a failing hook alone would let `if: always()` steps run: the worker itself is killed
-      expect(result.signal).toBe("SIGKILL");
-      expect(result.stdout).toContain("::error::");
-      expect(result.stdout).not.toContain("next step ran");
+      expectKilled(await runHook(event, payload));
     }
-  });
+  }, 60_000);
 
-  it("refuses a job it cannot check: fails closed on an unreadable or broken event", () => {
+  it("refuses a job it cannot check: fails closed on an unreadable or broken event", async () => {
     const forkless = { ref: "refs/heads/main" };
     for (const event of [
       { path: "missing" },
       { path: "directory" },
       { path: "unset" },
+      { raw: "" },
       { raw: '{"pull_request": {"head":' },
       { raw: "not json" },
+      { raw: "[]" },
+      { raw: '"devswha/ovis"' },
       { raw: '{"pull_request": "someone/ovis"}' },
+      // two documents: the second one alone would pass
+      { raw: `${JSON.stringify(fork)}\n${JSON.stringify(forkless)}` },
       { repository: "unset" },
+      { noJq: true },
       { path: "missing", closedOutput: true },
       // the shell's own `${VAR:?}` message on a closed stderr
       { path: "unset", closedOutput: true },
       { repository: "unset", closedOutput: true },
     ] as const) {
-      const result = runJobStarted("push", forkless, event);
-      expect(result.signal).toBe("SIGKILL");
-      // a closed output takes the refusal with it: the kill alone is the evidence there
-      if (!("closedOutput" in event)) expect(result.stdout).toContain("::error::");
-      expect(result.stdout).not.toContain("next step ran");
+      expectKilled(await runHook("push", forkless, event), "closedOutput" in event ? "closed" : "said");
     }
-  });
+  }, 60_000);
+
+  it("refuses an event that must name its head repository and does not, never taking it for this one's", async () => {
+    for (const [event, payload] of [
+      ["pull_request", {}],
+      ["pull_request", { pull_request: {} }],
+      ["pull_request", { action: "opened", number: 1 }],
+      ["pull_request_target", {}],
+      ["pull_request_review", {}],
+      ["pull_request_review_comment", {}],
+      ["workflow_run", {}],
+      ["workflow_run", { workflow_run: {} }],
+      ["issue_comment", {}],
+      ["issue_comment", { comment: { id: 2 } }],
+      // no event name: the runner always sets one
+      ["", { ref: "refs/heads/main" }],
+    ] as const) {
+      expectKilled(await runHook(event, payload));
+    }
+  }, 60_000);
+
+  it("proves its parent the worker through ps where there is no /proc, as on the Mac", async () => {
+    const run = await runHook("pull_request", fork, { ps: "procps" });
+    expect(run.parent).toBe("137");
+    expect(run.nextStepRan).toBe(false);
+    expect(run.decoys).toBe("alive");
+    expect(run.above).toBe("alive");
+    expect(run.output).toContain("::error::");
+    expect(run.psCalls).not.toBe("");
+    // with no /proc, the refusal goes to the system log
+    expect(run.logged).toContain("-t ovis-runner-guard");
+  }, 60_000);
+
+  it("blocks and kills nothing when its parent is not proven to be the worker", async () => {
+    const runs = await Promise.all(
+      (
+        [
+          // a live parent that is not the worker, as when a user's systemd manager adopted an earlier version of the hook
+          { parent: "named:systemd" },
+          { parent: "named:Runner.Worker2" },
+          { parent: "named:Runner.Worke" },
+          // the worker is an ancestor, not the parent: never walked to
+          { parent: "nested" },
+          // a name is not an executable: both must be Runner.Worker
+          { parent: "renamed" },
+          { parent: "posing" },
+          // without /proc: ps fails, prints nothing, or names the parent like the worker but not quite
+          { ps: "fails" },
+          { ps: "silent" },
+          { ps: "lookalike" },
+        ] as const
+      ).map((event) => runHook("pull_request", fork, event)),
+    );
+    for (const run of runs) expectBlocked(run);
+  }, 60_000);
+
+  /** A blocked refusal whose parent has ended: the hook ends too, having killed nothing; nothing waits on it any more. */
+  function expectEndedAfterBlock(run: Run) {
+    expect(run.output).toContain("this hook blocks (pid ");
+    expect(run.hook).toBe("ended");
+    // the parent ended by itself, with status 0
+    expect(run.parent).toBe("0");
+    expect(run.nextStepRan).toBe(false);
+    expect(run.decoys).toBe("alive");
+    expect(run.above).toBe("alive");
+  }
+
+  it("kills nothing when its parent ends before the refusal, whatever adopted it, and ends", async () => {
+    // the parent ends after the hook started: its `$PPID` names a pid that is gone
+    expectEndedAfterBlock(await runHook("pull_request", fork, { parent: "gone" }));
+  }, 60_000);
+
+  it("ends a block once the parent it started under is gone, killing nothing", async () => {
+    // a parent that is not the worker lives through the refusal, then ends
+    expectEndedAfterBlock(await runHook("pull_request", fork, { parent: "leaves" }));
+  }, 60_000);
 });
 
 describe.skipIf(process.platform === "win32")("build cache promotion", () => {

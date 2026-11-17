@@ -9,7 +9,7 @@ import { DEPLOY_ACTIONS, type Job, parseWorkflow, root, runScript, scriptProblem
 // there, or main's own push run that scripts/release-ci-reuse.ts verified, with Fast checks run
 // again on GitHub's runner. These tests hold the shape that makes a skipped, failed or cancelled job
 // stop a release instead of passing it, and run the two scripts that decide.
-type CallJob = Job & { name?: string; with?: Record<string, string>; "continue-on-error"?: boolean };
+type CallJob = Job & { name?: string; with?: Record<string, unknown>; "continue-on-error"?: boolean };
 interface Input { description?: string; required?: boolean; default?: unknown; type?: string }
 const wrapper = parseWorkflow(join(root, ".github/workflows/release-validate.yml"));
 const release = parseWorkflow(join(root, ".github/workflows/release.yml"));
@@ -125,9 +125,18 @@ describe("release-validate.yml", () => {
     const theirs = job(ciYml, "fast");
     const UPDATE = "release-validate.yml's `fast` job is ci.yml's Fast checks, which a release that takes main's run runs again on GitHub's runner: make the same change to both, so such a release still checks what every other does";
     const uploads = (candidate: Step): boolean => candidate.uses?.startsWith("actions/upload-artifact@") === true;
-    /** All of a job but where it runs and when, its artifact's name and this workflow's own answer left out. */
+    // the Release run restores no cache: this copy says `none`, ci.yml's says it under hosted_only, which the Release passes
+    const HOSTED_ONLY_CACHE = "${{ inputs.hosted_only && 'none' || 'save' }}";
+    expect(theirs.steps!.find((candidate) => candidate.uses === "./.github/actions/setup-ci")!.with!["cache"]).toBe(HOSTED_ONLY_CACHE);
+    expect(fast.steps!.find((candidate) => candidate.uses === "./.github/actions/setup-ci")!.with!["cache"]).toBe("none");
+    const withoutCache = (candidate: Step): Step => {
+      if (candidate.uses !== "./.github/actions/setup-ci" || (candidate.with?.["cache"] !== HOSTED_ONLY_CACHE && candidate.with?.["cache"] !== "none")) return candidate;
+      const { cache: _cache, ...inputs } = candidate.with;
+      return { ...candidate, with: inputs };
+    };
+    /** All of a job but where it runs and when, its artifact's name, ci.yml's hosted_only cache and this workflow's own answer left out. */
     const checks = ({ name: _name, needs: _needs, if: _if, "runs-on": _runner, "continue-on-error": _may, outputs: _outputs, ...rest }: CallJob): object =>
-      ({ ...rest, steps: rest.steps!.filter((candidate) => candidate.id !== "passed").map((candidate) => (uploads(candidate) ? { ...candidate, with: { ...candidate.with, name: "" } } : candidate)) });
+      ({ ...rest, steps: rest.steps!.filter((candidate) => candidate.id !== "passed").map(withoutCache).map((candidate) => (uploads(candidate) ? { ...candidate, with: { ...candidate.with, name: "" } } : candidate)) });
     expect(checks(fast), UPDATE).toEqual(checks(theirs));
     expect(fast["timeout-minutes"], UPDATE).toBe(theirs["timeout-minutes"]!);
     expect(fast.env, UPDATE).toEqual(theirs.env!);
@@ -146,7 +155,8 @@ describe("release-validate.yml", () => {
     expect(ci.needs).toBe("reuse");
     expect(ci.if).toBe("${{ !cancelled() && (inputs.revalidate || needs.reuse.result != 'success' || needs.reuse.outputs.green != 'true') }}");
     expect(ci.uses).toBe("./.github/workflows/ci.yml");
-    expect(ci.with).toBeUndefined();
+    // the Release run is GitHub-hosted and cacheless as a whole (scripts/privileged-jobs-workflow.test.ts)
+    expect(ci.with?.["hosted_only"]).toBe(true);
   });
 
   test("ends in a verdict that runs whatever happened before it", () => {
@@ -313,7 +323,7 @@ describe.skipIf(process.platform === "win32")("the reuse job's answer", () => {
     total_count: 1,
     workflow_runs: [{ id: RUN, path: ".github/workflows/ci.yml", event: "push", head_branch: "main", head_sha: SHA, status: "completed", conclusion, run_attempt: 1, repository: { full_name: REPO }, head_repository: { full_name: REPO } }],
   });
-  const names = [...CI_JOBS, ...matrixJobs(1)];
+  const names = [...CI_JOBS, ...matrixJobs(3)];
   const passed = { total_count: names.length, jobs: names.map((name) => ({ name, run_id: RUN, run_attempt: 1, head_sha: SHA, status: "completed", conclusion: "success" })) };
 
   test("with the script itself: a green run of main is a yes, a failed one and a GitHub that fails are a no", async () => {

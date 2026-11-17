@@ -703,7 +703,8 @@ export type ConversationPart =
      * What the transcript itself records of the call's outcome, never guessed from its output text.
      * Claude: `pending` until its tool_result, then `ok`, or `error` when the result is flagged so.
      * Codex: `pending` until its output record, then absent (it records no failure flag: done, outcome
-     * unknown). Absent for other agents and older servers.
+     * unknown). OpenCode: `pending` while waiting or running, then `ok` or `error` as it records the call.
+     * Absent for other agents and older servers.
      */
     state?: "pending" | "ok" | "error";
   }
@@ -1195,7 +1196,7 @@ export interface PendingMessage {
 
 export type ClientMessage =
   /** Subscribe to this connection server's authorized machine document; requires machine-events. */
-  | { type: "machine-events"; enabled: boolean }
+  | { type: "machine-events"; enabled: boolean; compact_agents?: boolean }
   /** keep_size: the grid is covered (the chat lens), so the attach leaves the shared pty's size as it is */
   | { type: "attach"; pane_id: string; cols: number; rows: number; flow_control?: "ack"; keep_size?: boolean; /** Opaque browser UUID for device-bound Pi presentation receipts only; never input authority. */ receipt_resume_id?: string }
   | { type: "detach"; pane_id: string }
